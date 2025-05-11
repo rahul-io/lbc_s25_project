@@ -1,14 +1,16 @@
 import gymnasium as gym
-from stable_baselines3 import PPO
-from RocketLander import RocketLander
+from RocketLander import RocketLander  # your file
 
-if __name__ == "__main__":
-    # Create the RocketLander environment
-    env = RocketLander(enable_wind=False, render_mode="human")
-    obs, info = env.reset()
-    for _ in range(1000):
+env = RocketLander(render_mode="human")
+obs, info = env.reset(seed=0)
+
+done, truncated = False, False
+for _ in range(10000):
+    action = env.action_space.sample()
+    obs, reward, done, truncated, info = env.step(action)
+    if env.render_mode == "human":
         env.render()
-        action = env.action_space.sample()  # Replace with your policy or agent
-        obs, reward, terminated, truncated, info = env.step(action)
-        if terminated or truncated:
-            obs, info = env.reset()
+    if done or truncated:
+        obs, info = env.reset()
+
+env.close()

@@ -1,139 +1,555 @@
+"""rocket_lander_env.py
+====================================
+Continuous‑action rocket‑landing task using **Gymnasium ≥ 0.29** and its
+Pygame renderer (no pyglet viewer required).
+
+Install requirements (Python 3.8–3.12):
+```bash
+pip install "gymnasium[box2d,classic_control]"
+```
+
+Example
+-------
+```python
 import gymnasium as gym
+import rocket_lander_env  # this file
+
+env = gym.make("RocketLander-v0", render_mode="human")
+obs, _ = env.reset(seed=0)
+while True:
+    obs, r, term, trunc, _ = env.step(env.action_space.sample())
+    if term or trunc:
+        break
+env.close()
+```
+"""
+from __future__ import annotations
+
+import math
+from typing import Any, List, Tuple
+
 import numpy as np
-from gymnasium.envs.box2d.lunar_lander import (
-    LunarLander,
-    SCALE,
-    VIEWPORT_W,
-    VIEWPORT_H,
-    MAIN_ENGINE_POWER,
+from Box2D import b2World  # type: ignore
+from Box2D.b2 import (
+    contactListener,
+    distanceJointDef,
+    fixtureDef,
+    polygonShape,
+    revoluteJointDef,
 )
-from contextlib import contextmanager
+import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.utils import EzPickle, seeding
 
-class RocketLander(LunarLander):
+# -----------------------------------------------------------------------------
+# Physics / geometry constants
+# -----------------------------------------------------------------------------
+CONTINUOUS = True
+VEL_STATE = True
+FPS = 60
+SCALE_S = 0.35
+INITIAL_RANDOM = 0.4
+START_HEIGHT = 800.0
+START_SPEED = 80.0
 
-    metadata = LunarLander.metadata
+MIN_THROTTLE = 0.4
+GIMBAL_THRESHOLD = 0.4
+MAIN_ENGINE_POWER = 1600 * SCALE_S
+SIDE_ENGINE_POWER = 100 / FPS * SCALE_S
 
-    def __init__(
-        self,
-        enable_wind: bool = False,
-        wind_power: float = 0.0,
-        turbulence_power: float = 0.0,
-        **kwargs,
-    ):
-        # call the original constructor so we get the whole physics world,
-        # reward function, terrain builder, wind generator, etc.
-        super().__init__(
-            continuous=False,                 
-            enable_wind=enable_wind,
-            wind_power=wind_power,
-            turbulence_power=turbulence_power,
-            **kwargs,
+ROCKET_WIDTH = 3.66 * SCALE_S
+ROCKET_HEIGHT = ROCKET_WIDTH / 3.7 * 47.9
+ENGINE_OFFSET_Y = -ROCKET_WIDTH * 0.2  # nozzle below COM
+THRUSTER_HEIGHT = ROCKET_HEIGHT * 0.86
+
+LEG_LENGTH = ROCKET_WIDTH * 2.2
+BASE_ANGLE = -0.27
+SPRING_ANGLE = 0.27
+LEG_AWAY = ROCKET_WIDTH / 2
+
+SHIP_HEIGHT = ROCKET_WIDTH
+SHIP_WIDTH = SHIP_HEIGHT * 40
+
+VIEWPORT_H, VIEWPORT_W = 720, 500
+H = 1.1 * START_HEIGHT * SCALE_S
+W = float(VIEWPORT_W) / VIEWPORT_H * H
+
+MAX_SMOKE_LIFETIME = 2 * FPS
+
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
+
+def _rgb(r: int, g: int, b: int) -> Tuple[int, int, int]:
+    return r, g, b
+
+
+def _w2s(x: float, y: float) -> Tuple[int, int]:
+    sx = int(x * (VIEWPORT_W / W))
+    sy = int(y * (VIEWPORT_H / H))
+    return sx, VIEWPORT_H - sy
+
+# -----------------------------------------------------------------------------
+# Contact listener
+# -----------------------------------------------------------------------------
+
+
+class _Contact(contactListener):
+    def __init__(self, env: "RocketLander"):
+        super().__init__()
+        self.env = env
+
+    def BeginContact(self, contact):  # noqa: N802
+        bodies = (contact.fixtureA.body, contact.fixtureB.body)
+        if any(b in bodies for b in (self.env.water, self.env.lander, *self.env.containers)):
+            self.env._game_over = True
+            return
+        for leg in self.env.legs:
+            if leg in bodies:
+                leg.ground_contact = True
+
+    def EndContact(self, contact):  # noqa: N802
+        bodies = (contact.fixtureA.body, contact.fixtureB.body)
+        for leg in self.env.legs:
+            if leg in bodies:
+                leg.ground_contact = False
+
+# -----------------------------------------------------------------------------
+# Main environment
+# -----------------------------------------------------------------------------
+
+
+class RocketLander(gym.Env, EzPickle):
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": FPS}
+
+    def __init__(self, *, render_mode: str | None = None):
+        EzPickle.__init__(self, render_mode=render_mode)
+        self.render_mode = render_mode
+
+        # Box2D world and placeholders
+        self.world: b2World = b2World()
+        self.water = self.lander = self.ship = None  # type: ignore[assignment]
+        self.containers: list[Any] = []
+        self.legs: list[Any] = []
+
+        # RNG object assigned in reset
+        self.np_random: np.random.Generator
+
+        # Spaces
+        high = np.array([1] * 7 + [np.inf] * 3, dtype=np.float32)
+        low = -high
+        if not VEL_STATE:
+            high, low = high[:7], low[:7]
+        self.observation_space = spaces.Box(low, high, dtype=np.float32)
+        self.action_space = spaces.Box(-1.0, 1.0, (3,), dtype=np.float32)
+
+        # Episode vars
+        self._prev_shaping: float | None = None
+        self._game_over = False
+        self._landed_ticks = 0
+        self._step_count = 0
+        self.throttle = 0.0
+        self.gimbal = 0.0
+        self.force_dir = 0
+        self.power = 0.0
+
+        # Rendering handles
+        self._window = self._surface = None  # created lazily
+
+    # ------------------------------------------------------------------
+    # Gymnasium API methods
+    # ------------------------------------------------------------------
+    def reset(self, *, seed: int | None = None, options=None):  # type: ignore[override]
+        super().reset(seed=seed)
+        self.np_random, _ = seeding.np_random(seed)
+
+        self._destroy_world()
+        self._build_world()
+
+        self._prev_shaping = None
+        self._game_over = False
+        self._landed_ticks = 0
+        self._step_count = 0
+        self._smoke: list[list[Any]] = []
+
+        return self._get_state(), {}
+
+    def step(self, action):  # type: ignore[override]
+        action = np.clip(action, -1, 1)
+        self.gimbal += action[0] * 0.15 / FPS
+        self.throttle += action[1] * 0.5 / FPS
+        self.force_dir = 1 if action[2] > 0.5 else -1 if action[2] < -0.5 else 0
+        self.gimbal = float(np.clip(self.gimbal, -GIMBAL_THRESHOLD, GIMBAL_THRESHOLD))
+        self.throttle = float(np.clip(self.throttle, 0.0, 1.0))
+        self.power = 0.0 if self.throttle == 0 else MIN_THROTTLE + self.throttle * (1 - MIN_THROTTLE)
+
+        # Main engine
+        force = (
+            -math.sin(self.lander.angle + self.gimbal) * MAIN_ENGINE_POWER * self.power,
+            math.cos(self.lander.angle + self.gimbal) * MAIN_ENGINE_POWER * self.power,
+        )
+        self.lander.ApplyForce(force=force, point=tuple(self.lander.position), wake=False)
+
+        # Side thruster
+        thrust_pos = self.lander.position + THRUSTER_HEIGHT * np.array((math.sin(self.lander.angle), math.cos(self.lander.angle)))
+        force_c = (
+            -self.force_dir * math.cos(self.lander.angle) * SIDE_ENGINE_POWER,
+            self.force_dir * math.sin(self.lander.angle) * SIDE_ENGINE_POWER,
+        )
+        self.lander.ApplyLinearImpulse(impulse=force_c, point=tuple(thrust_pos), wake=False)
+
+        # Physics step
+        self.world.Step(1.0 / FPS, 60, 60)
+
+        obs = self._get_state()
+        reward, terminated = self._compute_reward()
+        self._step_count += 1
+        return obs, reward, terminated, False, {}
+    
+    def render(self):  # ← inside class RocketLander
+        """
+        Pygame renderer supporting `render_mode == "human"` or `"rgb_array"`.
+        Creates the window lazily, so importing the env on head-less machines
+        will not raise a display error unless you actually call render().
+        """
+        if self.render_mode is None:          # no-op if rendering disabled
+            return None
+
+        import pygame  # runtime import keeps head-less servers happy
+
+        # ------------------------------------------------------------------
+        # 1.  Lazy-create window / surface
+        # ------------------------------------------------------------------
+        if self._window is None:
+            if self.render_mode == "human":
+                pygame.init()
+                self._window = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))
+            else:  # "rgb_array"
+                self._window = pygame.Surface((VIEWPORT_W, VIEWPORT_H))
+            self._surface = self._window
+            pygame.display.set_caption("RocketLander-v0")
+
+        # ------------------------------------------------------------------
+        # 2.  Clear background
+        # ------------------------------------------------------------------
+        self._surface.fill(_rgb(126, 150, 233))  # sky-blue
+
+        # Water
+        pygame.draw.rect(
+            self._surface,
+            _rgb(70, 96, 176),
+            pygame.Rect(
+                0,
+                VIEWPORT_H - int(self.terrainheight * VIEWPORT_H / H),
+                VIEWPORT_W,
+                VIEWPORT_H,
+            ),
         )
 
-        kwargs.pop("continuous", None)
-        self.SCALE = SCALE
-        self.VIEWPORT_W = VIEWPORT_W
-        self.VIEWPORT_H = VIEWPORT_H
-        self.engine_power = MAIN_ENGINE_POWER
-
-        self._ll_action_space = self.action_space          # Discrete(4)
-
-        self.action_space = gym.spaces.Box(
-            low=np.array([0.0, -np.pi/4], dtype=np.float32),
-            high=np.array([1.0, np.pi/4], dtype=np.float32),
-            dtype=np.float32,
+        # ------------------------------------------------------------------
+        # 3.  Ship deck + helipad
+        # ------------------------------------------------------------------
+        x1, y1 = _w2s(self.helipad_x1, self.terrainheight)
+        x2, y2 = _w2s(self.helipad_x2, self.shipheight)
+        pygame.draw.rect(
+            self._surface,
+            _rgb(51, 51, 51),
+            pygame.Rect(x1, y2, x2 - x1, y1 - y2),
         )
+        # Helipad yellow line
+        hx1, hy = _w2s(self.helipad_x1, self.shipheight)
+        hx2, _  = _w2s(self.helipad_x2, self.shipheight)
+        pygame.draw.line(self._surface, _rgb(206, 206, 2), (hx1, hy), (hx2, hy), 2)
 
-        self._last_thrust = 0.0          # keep for the next render call
-        self._last_gimbal = 0.0
+        # ------------------------------------------------------------------
+        # 4.  Rocket body (simple rotated rectangle)
+        # ------------------------------------------------------------------
+        rx, ry = self.lander.position
+        sx, sy = _w2s(rx, ry)
+        angle_deg = -math.degrees(self.lander.angle)
 
-        # Nozzle in BODY coordinates (copied from LL source: about 14 px below COM)
-        self._nozzle_local = (0.0, -14.0 / self.SCALE)
+        body_surf = pygame.Surface(
+            (
+                int(ROCKET_WIDTH  * VIEWPORT_W / W),
+                int(ROCKET_HEIGHT * VIEWPORT_H / H),
+            ),
+            pygame.SRCALPHA,
+        )
+        body_surf.fill(_rgb(230, 230, 230))
+        body_rot = pygame.transform.rotozoom(body_surf, angle_deg, 1.0)
+        rect = body_rot.get_rect(center=(sx, sy))
+        self._surface.blit(body_rot, rect)
 
-    def step(self, action):
-        if np.isscalar(action):          # called by LL.reset() or legacy code
-            thrust = 0.0
-            rel_angle = 0.0
-        else:
-            thrust, rel_angle = np.clip(action, self.action_space.low, self.action_space.high)
-            self._last_thrust, self._last_gimbal = float(thrust), float(rel_angle)
-
-        magnitude   = thrust * self.engine_power        # N
-        world_angle = self.lander.angle + rel_angle
-        fx = -np.sin(world_angle) * magnitude
-        fy =  np.cos(world_angle) * magnitude
-        self.lander.ApplyForceToCenter((float(fx), float(fy)), True)
-
-        with self._use_ll_action_space():
-            obs, reward, terminated, truncated, info = super().step(0)
-
-        return obs, reward, terminated, truncated, info
-
-    
-    def reset(self, *, seed: int | None = None, options=None):
-        with self._use_ll_action_space():
-            obs, info = super().reset(seed=seed, options=options)
-
-        # Move lander horizontally; keep top-of-screen y
-        INITIAL_Y = 1.0                        # 1.0 is the max y in LL's coordinates
-        rand_x = self.np_random.uniform(-0.5, 0.5)   # tweak range as you like
-        self.lander.position = (rand_x, INITIAL_Y)
-
-        # Give the Box2D body a random tilt
-        random_angle = self.np_random.uniform(-np.pi/4, np.pi/4)
-        self.lander.angle = random_angle
-        self.lander.angularVelocity = 0.0
-
-        # Update the returned observation to reflect the new pose
-        return obs, info
-    
-    def render(self, mode=None):
-        img = super().render()           # background, terrain, etc.
-        
-        if not hasattr(self, "viewer") or self.viewer is None:
-            return img
-
-        # (1) nozzle world-coords
-        cx, cy = self.lander.position
-        nx, ny = self._nozzle_local
-        sin_theta, cos_theta = np.sin(self.lander.angle), np.cos(self.lander.angle)
-        wx = cx + cos_theta * nx - sin_theta * ny
-        wy = cy + sin_theta * nx + cos_theta * ny
-
-        # (2) plume tip
-        world_angle = self.lander.angle + self._last_gimbal
-        length = 30.0 * self._last_thrust / self.SCALE
-        ex = wx - np.sin(world_angle) * length
-        ey = wy + np.cos(world_angle) * length
-
-        # (3) world → screen
-        def w2s(x, y):
-            return (
-                x * self.SCALE + self.VIEWPORT_W / 2,
-                y * self.SCALE + self.VIEWPORT_H / 4,
+        # ------------------------------------------------------------------
+        # 5.  Main-engine flame (line whose length ∝ throttle)
+        # ------------------------------------------------------------------
+        if self.power > 0.0:
+            nx, ny = _w2s(rx, ry + ENGINE_OFFSET_Y)
+            flame_tip = (
+                nx - math.sin(self.lander.angle + self.gimbal) * 40 * self.power,
+                ny + math.cos(self.lander.angle + self.gimbal) * 40 * self.power,
+            )
+            pygame.draw.line(
+                self._surface,
+                _rgb(255, 200, 50),
+                (nx, ny),
+                flame_tip,
+                width=4,
             )
 
-        sx1, sy1 = w2s(wx, wy)
-        sx2, sy2 = w2s(ex, ey)
-
-        # draw / update the polyline
-        if not hasattr(self, "_plume"):
-            self._plume = self.viewer.draw_polyline(
-                [(sx1, sy1), (sx2, sy2)],
-                color=(1.0, 0.5, 0.0),
-                linewidth=2,
+        # ------------------------------------------------------------------
+        # 6.  Smoke puffs (very light particle system)
+        # ------------------------------------------------------------------
+        if self._step_count % max(1, FPS // 10) == 0 and self.power > 0.0:
+            self._smoke.append(  # [ttl, age, screen-pos]
+                [MAX_SMOKE_LIFETIME * self.power, 0, _w2s(rx, ry + ENGINE_OFFSET_Y)]
             )
+
+        for puff in list(self._smoke):
+            puff[1] += 1
+            if puff[1] > puff[0]:
+                self._smoke.remove(puff)
+                continue
+            radius = int(6 + puff[1] / 2)
+            alpha = max(0, 255 - int(255 * (puff[1] / puff[0])))
+            puff_surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+            pygame.draw.circle(
+                puff_surf, (*_rgb(200, 210, 230), alpha), (radius, radius), radius
+            )
+            sx_p, sy_p = puff[2]
+            self._surface.blit(puff_surf, (sx_p - radius, sy_p - radius + puff[1] // 3))
+
+        # ------------------------------------------------------------------
+        # 7.  Present frame / return pixels
+        # ------------------------------------------------------------------
+        if self.render_mode == "human":
+            pygame.display.flip()
+            # keep window responsive
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.close()
+        else:  # "rgb_array"
+            return np.transpose(
+                np.array(self._surface, copy=False), (1, 0, 2)
+            )  # HWC → HWC (already)
+
+    # ------------------------------------------------------------------
+    # World-lifecycle helpers
+    # ------------------------------------------------------------------
+    def _destroy_world(self) -> None:
+        """Remove all Box2D bodies from the previous episode (if any)."""
+        if self.water is None:                # nothing to clean up
+            return
+
+        # Detach the contact listener first to avoid Box2D assertions
+        self.world.contactListener = None     # type: ignore[attr-defined]
+
+        for body in [self.water, self.lander, self.ship, *self.legs, *self.containers]:
+            self.world.DestroyBody(body)
+
+        # Clear references
+        self.water = self.lander = self.ship = None      # type: ignore[assignment]
+        self.legs.clear()
+        self.containers.clear()
+
+    # ------------------------------------------------------------------
+    # World construction
+    # ------------------------------------------------------------------
+    def _build_world(self) -> None:
+        """Create water, ship deck, lander, legs and joints for a new episode."""
+        # Contact listener
+        self.world.contactListener_keepref = _Contact(self)  # type: ignore[attr-defined]
+        self.world.contactListener = self.world.contactListener_keepref  # type: ignore[attr-defined]
+
+        # --- Static water rectangle -------------------------------------------------
+        self.terrainheight = H / 20                           # flat sea
+        water_poly = ((0, 0), (W, 0), (W, self.terrainheight), (0, self.terrainheight))
+        self.water = self.world.CreateStaticBody(
+            fixtures=fixtureDef(shape=polygonShape(vertices=water_poly), friction=0.1)
+        )
+        self.water.color1 = _rgb(70, 96, 176)
+
+        # --- Ship deck --------------------------------------------------------------
+        self.shipheight = self.terrainheight + SHIP_HEIGHT
+        ship_x = W / 2
+        self.helipad_x1 = ship_x - SHIP_WIDTH / 2
+        self.helipad_x2 = ship_x + SHIP_WIDTH / 2
+
+        ship_poly = (
+            (self.helipad_x1, self.terrainheight),
+            (self.helipad_x2, self.terrainheight),
+            (self.helipad_x2, self.shipheight),
+            (self.helipad_x1, self.shipheight),
+        )
+        self.ship = self.world.CreateStaticBody(
+            fixtures=fixtureDef(shape=polygonShape(vertices=ship_poly), friction=0.5)
+        )
+        self.ship.color1 = _rgb(51, 51, 51)
+
+        # Containers at the edges (penalty objects)
+        self.containers = []
+        for side in (-1, 1):
+            dx = side * 0.95 * SHIP_WIDTH / 2
+            verts = (
+                (ship_x + dx, self.shipheight),
+                (ship_x + dx, self.shipheight + SHIP_HEIGHT),
+                (ship_x + dx - side * SHIP_HEIGHT, self.shipheight + SHIP_HEIGHT),
+                (ship_x + dx - side * SHIP_HEIGHT, self.shipheight),
+            )
+            body = self.world.CreateStaticBody(
+                fixtures=fixtureDef(shape=polygonShape(vertices=verts), friction=0.2)
+            )
+            body.color1 = _rgb(206, 206, 2)
+            self.containers.append(body)
+
+        # --- Lander -----------------------------------------------------------------
+        spawn_x = W / 2 + W * self.np_random.uniform(-0.3, 0.3)
+        spawn_y = H * 0.95
+        lander_poly = (
+            (-ROCKET_WIDTH / 2, 0),
+            (ROCKET_WIDTH / 2, 0),
+            (ROCKET_WIDTH / 2, ROCKET_HEIGHT),
+            (-ROCKET_WIDTH / 2, ROCKET_HEIGHT),
+        )
+        self.lander = self.world.CreateDynamicBody(
+            position=(spawn_x, spawn_y),
+            fixtures=fixtureDef(shape=polygonShape(vertices=lander_poly), density=1.0, friction=0.5),
+        )
+        self.lander.color1 = _rgb(230, 230, 230)
+
+        # --- Legs -------------------------------------------------------------------
+        self.legs.clear()
+        for side in (-1, 1):
+            leg = self.world.CreateDynamicBody(
+                position=(spawn_x - side * LEG_AWAY, spawn_y + ROCKET_WIDTH * 0.2),
+                angle=side * BASE_ANGLE,
+                fixtures=fixtureDef(
+                    shape=polygonShape(
+                        vertices=(
+                            (0, 0),
+                            (0, LEG_LENGTH / 25),
+                            (side * LEG_LENGTH, 0),
+                            (side * LEG_LENGTH, -LEG_LENGTH / 20),
+                            (side * LEG_LENGTH / 3, -LEG_LENGTH / 7),
+                        )
+                    ),
+                    density=1.0,
+                    friction=0.2,
+                ),
+            )
+            leg.ground_contact = False                       # type: ignore[attr-defined]
+            leg.color1 = _rgb(64, 64, 64)
+
+            # Revolute spring joint
+            rjd = revoluteJointDef(
+                bodyA=self.lander,
+                bodyB=leg,
+                localAnchorA=(side * LEG_AWAY, ROCKET_WIDTH * 0.2),
+                localAnchorB=(0, 0),
+                enableLimit=True,
+                enableMotor=True,
+                maxMotorTorque=2500.0,
+                motorSpeed=-0.05 * side,
+            )
+            if side == 1:
+                rjd.lowerAngle, rjd.upperAngle = -SPRING_ANGLE, 0
+            else:
+                rjd.lowerAngle, rjd.upperAngle = 0, SPRING_ANGLE
+            leg.joint = self.world.CreateJoint(rjd)
+
+            # Distance joint for damping
+            djd = distanceJointDef(
+                bodyA=self.lander,
+                bodyB=leg,
+                anchorA=(side * LEG_AWAY, ROCKET_HEIGHT / 8),
+                anchorB=leg.fixtures[0].body.transform * (side * LEG_LENGTH, 0),
+                collideConnected=False,
+                frequencyHz=0.01,
+                dampingRatio=0.9,
+            )
+            leg.joint2 = self.world.CreateJoint(djd)
+            self.legs.append(leg)
+
+        # Initial velocities
+        self.lander.linearVelocity = (
+            -self.np_random.uniform(0, INITIAL_RANDOM) * START_SPEED * (spawn_x - W / 2) / W,
+            -START_SPEED,
+        )
+        self.lander.angularVelocity = (1 + INITIAL_RANDOM) * self.np_random.uniform(-1, 1)
+
+    # ------------------------------------------------------------------
+    # Observation helper
+    # ------------------------------------------------------------------
+    def _get_state(self) -> np.ndarray:
+        pos = self.lander.position
+        vel = np.array(self.lander.linearVelocity) / START_SPEED
+        angle = (self.lander.angle / math.pi) % 2
+        angle = angle - 2 if angle > 1 else angle
+
+        x_dist = (pos.x - W / 2) / W
+        y_dist = (pos.y - self.shipheight) / (H - self.shipheight)
+
+        state: List[float] = [
+            2 * x_dist,
+            2 * (y_dist - 0.5),
+            angle,
+            1.0 if self.legs[0].ground_contact else 0.0,
+            1.0 if self.legs[1].ground_contact else 0.0,
+            2 * (self.throttle - 0.5),
+            self.gimbal / GIMBAL_THRESHOLD,
+        ]
+        if VEL_STATE:
+            state.extend([vel[0], vel[1], self.lander.angularVelocity])
+        return np.array(state, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Reward / termination helper
+    # ------------------------------------------------------------------
+    def _compute_reward(self) -> Tuple[float, bool]:
+        pos = self.lander.position
+        vel_l = np.array(self.lander.linearVelocity) / START_SPEED
+        vel_a = self.lander.angularVelocity
+
+        x_dist = (pos.x - W / 2) / W
+        y_dist = (pos.y - self.shipheight) / (H - self.shipheight)
+        distance = np.linalg.norm((3 * x_dist, y_dist))           # x weighted more
+        speed = np.linalg.norm(vel_l)
+
+        angle = (self.lander.angle / math.pi) % 2
+        angle = angle - 2 if angle > 1 else angle
+
+        ground_contact = self.legs[0].ground_contact or self.legs[1].ground_contact
+        broken_leg = ((self.legs[0].joint.angle < 0 or self.legs[1].joint.angle > 0) and ground_contact)
+        outside = abs(pos.x - W / 2) > W / 2 or pos.y > H
+        fuel_cost = 0.1 * (0.5 * self.power + abs(self.force_dir)) / FPS
+        landed = ground_contact and speed < 0.1
+
+        reward = -fuel_cost
+        terminated = False
+
+        if outside or broken_leg:
+            self._game_over = True
+
+        if self._game_over:
+            terminated = True
         else:
-            self._plume.v = (sx1, sy1, sx2, sy2)   # just overwrite the 4-tuple
+            shaping = (
+                -0.5 * (distance + speed + angle ** 2 + vel_a ** 2)
+                + 0.1 * (self.legs[0].ground_contact + self.legs[1].ground_contact)
+            )
+            if self._prev_shaping is not None:
+                reward += shaping - self._prev_shaping
+            self._prev_shaping = shaping
 
-        return img
+            if landed:
+                self._landed_ticks += 1
+            else:
+                self._landed_ticks = 0
+            if self._landed_ticks >= FPS:
+                reward = 1.0
+                terminated = True
 
-    @contextmanager
-    def _use_ll_action_space(self):
-        """Temporarily restore the parent Discrete(4) space for its own checks."""
-        orig = self.action_space
-        self.action_space = self._ll_action_space
-        try:
-            yield
-        finally:
-            self.action_space = orig
+        if terminated:
+            reward += max(-1, 0 - 2 * (speed + distance + abs(angle) + abs(vel_a)))
+
+        return float(np.clip(reward, -1, 1)), terminated
