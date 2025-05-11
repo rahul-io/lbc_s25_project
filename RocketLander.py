@@ -52,10 +52,10 @@ INITIAL_RANDOM = 0.4
 START_HEIGHT = 800.0
 START_SPEED = 80.0
 
-MIN_THROTTLE = 0.4
-GIMBAL_THRESHOLD = 0.4
+# not worrying about min throttle for now
+# MIN_THROTTLE = 0.4
+GIMBAL_LIMIT = math.pi/4
 MAIN_ENGINE_POWER = 1600 * SCALE_S
-SIDE_ENGINE_POWER = 100 / FPS * SCALE_S
 
 ROCKET_WIDTH = 3.66 * SCALE_S
 ROCKET_HEIGHT = ROCKET_WIDTH / 3.7 * 47.9
@@ -175,13 +175,10 @@ class RocketLander(gym.Env, EzPickle):
         return self._get_state(), {}
 
     def step(self, action):  # type: ignore[override]
-        action = np.clip(action, -1, 1)
-        self.gimbal += action[0] * 0.15 / FPS
-        self.throttle += action[1] * 0.5 / FPS
-        self.force_dir = 1 if action[2] > 0.5 else -1 if action[2] < -0.5 else 0
-        self.gimbal = float(np.clip(self.gimbal, -GIMBAL_THRESHOLD, GIMBAL_THRESHOLD))
-        self.throttle = float(np.clip(self.throttle, 0.0, 1.0))
-        self.power = 0.0 if self.throttle == 0 else MIN_THROTTLE + self.throttle * (1 - MIN_THROTTLE)
+        action = np.clip(action, self.action_space.low, self.action_space.high)
+        self.gimbal   = float(action[0])          # rad (-π/4 … +π/4)
+        self.throttle = float(action[1])          # 0 … 1
+        self.power = self.throttle
 
         # Main engine
         force = (
@@ -189,14 +186,6 @@ class RocketLander(gym.Env, EzPickle):
             math.cos(self.lander.angle + self.gimbal) * MAIN_ENGINE_POWER * self.power,
         )
         self.lander.ApplyForce(force=force, point=tuple(self.lander.position), wake=False)
-
-        # Side thruster
-        thrust_pos = self.lander.position + THRUSTER_HEIGHT * np.array((math.sin(self.lander.angle), math.cos(self.lander.angle)))
-        force_c = (
-            -self.force_dir * math.cos(self.lander.angle) * SIDE_ENGINE_POWER,
-            self.force_dir * math.sin(self.lander.angle) * SIDE_ENGINE_POWER,
-        )
-        self.lander.ApplyLinearImpulse(impulse=force_c, point=tuple(thrust_pos), wake=False)
 
         # Physics step
         self.world.Step(1.0 / FPS, 60, 60)
@@ -496,7 +485,7 @@ class RocketLander(gym.Env, EzPickle):
             1.0 if self.legs[0].ground_contact else 0.0,
             1.0 if self.legs[1].ground_contact else 0.0,
             2 * (self.throttle - 0.5),
-            self.gimbal / GIMBAL_THRESHOLD,
+            self.gimbal / GIMBAL_LIMIT,
         ]
         if VEL_STATE:
             state.extend([vel[0], vel[1], self.lander.angularVelocity])
@@ -521,7 +510,7 @@ class RocketLander(gym.Env, EzPickle):
         ground_contact = self.legs[0].ground_contact or self.legs[1].ground_contact
         broken_leg = ((self.legs[0].joint.angle < 0 or self.legs[1].joint.angle > 0) and ground_contact)
         outside = abs(pos.x - W / 2) > W / 2 or pos.y > H
-        fuel_cost = 0.1 * (0.5 * self.power + abs(self.force_dir)) / FPS
+        fuel_cost = 0.1 * (0.5 * self.power) / FPS
         landed = ground_contact and speed < 0.1
 
         reward = -fuel_cost
