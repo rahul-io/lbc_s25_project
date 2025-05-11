@@ -59,8 +59,7 @@ MAIN_ENGINE_POWER = 1600 * SCALE_S
 
 ROCKET_WIDTH = 3.66 * SCALE_S
 ROCKET_HEIGHT = ROCKET_WIDTH / 3.7 * 47.9
-ENGINE_OFFSET_Y = -ROCKET_WIDTH * 0.2  # nozzle below COM
-THRUSTER_HEIGHT = ROCKET_HEIGHT * 0.86
+NOZZLE_LOCAL = (0.0, -ROCKET_HEIGHT / 2)
 
 LEG_LENGTH = ROCKET_WIDTH * 2.2
 BASE_ANGLE = -0.27
@@ -74,7 +73,6 @@ VIEWPORT_H, VIEWPORT_W = 720, 500
 H = 1.1 * START_HEIGHT * SCALE_S
 W = float(VIEWPORT_W) / VIEWPORT_H * H
 
-MAX_SMOKE_LIFETIME = 2 * FPS
 
 # -----------------------------------------------------------------------------
 # Utility helpers
@@ -141,7 +139,11 @@ class RocketLander(gym.Env, EzPickle):
         if not VEL_STATE:
             high, low = high[:7], low[:7]
         self.observation_space = spaces.Box(low, high, dtype=np.float32)
-        self.action_space = spaces.Box(-1.0, 1.0, (3,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=np.array([-GIMBAL_LIMIT, 0.0], dtype=np.float32),
+            high=np.array([+GIMBAL_LIMIT, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
 
         # Episode vars
         self._prev_shaping: float | None = None
@@ -150,7 +152,6 @@ class RocketLander(gym.Env, EzPickle):
         self._step_count = 0
         self.throttle = 0.0
         self.gimbal = 0.0
-        self.force_dir = 0
         self.power = 0.0
 
         # Rendering handles
@@ -170,7 +171,6 @@ class RocketLander(gym.Env, EzPickle):
         self._game_over = False
         self._landed_ticks = 0
         self._step_count = 0
-        self._smoke: list[list[Any]] = []
 
         return self._get_state(), {}
 
@@ -180,15 +180,37 @@ class RocketLander(gym.Env, EzPickle):
         self.throttle = float(action[1])          # 0 … 1
         self.power = self.throttle
 
-        # Main engine
-        force = (
-            -math.sin(self.lander.angle + self.gimbal) * MAIN_ENGINE_POWER * self.power,
-            math.cos(self.lander.angle + self.gimbal) * MAIN_ENGINE_POWER * self.power,
+        nozzle_world = self.lander.GetWorldPoint(NOZZLE_LOCAL)
+        print("step function")
+        print("nozzle_local", NOZZLE_LOCAL)
+
+        # unit vector in engine direction (lander-up rotated by gimbal)
+        thrust_dir_world = self.lander.GetWorldVector(
+            (-math.sin(self.gimbal), math.cos(self.gimbal))
         )
-        self.lander.ApplyForce(force=force, point=tuple(self.lander.position), wake=False)
+
+        print("gimbal (degrees)", math.degrees(self.gimbal))
+        
+        deg_expected = math.degrees(self.gimbal + self.lander.angle + math.pi/2)
+        deg_actual = math.degrees(math.atan2(thrust_dir_world[1], thrust_dir_world[0]))
+        print("calculated thrust_dir_world", deg_expected)
+        print("thrust_dir_world (degrees)", deg_actual)
+        print("diff", (deg_expected - deg_actual + 180) % 360 - 180)
+        # print("throttle", self.throttle)
+
+        main_force = (
+            thrust_dir_world[0] * MAIN_ENGINE_POWER * self.power,
+            thrust_dir_world[1] * MAIN_ENGINE_POWER * self.power,
+        )
+
+        # apply at nozzle → produces torque when gimballed
+        self.lander.ApplyForce(force=main_force, point=nozzle_world, wake=False)
 
         # Physics step
         self.world.Step(1.0 / FPS, 60, 60)
+        print("nozzle_world", nozzle_world)
+        print("lander position", self.lander.position)
+        print("lander angle (degrees)", math.degrees(self.lander.angle))
 
         obs = self._get_state()
         reward, terminated = self._compute_reward()
@@ -204,7 +226,10 @@ class RocketLander(gym.Env, EzPickle):
         if self.render_mode is None:          # no-op if rendering disabled
             return None
 
-        import pygame  # runtime import keeps head-less servers happy
+        import pygame
+        
+        if not hasattr(self, "_clock"):
+            self._clock = pygame.time.Clock()
 
         # ------------------------------------------------------------------
         # 1.  Lazy-create window / surface
@@ -253,66 +278,78 @@ class RocketLander(gym.Env, EzPickle):
         # ------------------------------------------------------------------
         # 4.  Rocket body (simple rotated rectangle)
         # ------------------------------------------------------------------
-        rx, ry = self.lander.position
-        sx, sy = _w2s(rx, ry)
-        angle_deg = -math.degrees(self.lander.angle)
 
-        body_surf = pygame.Surface(
-            (
-                int(ROCKET_WIDTH  * VIEWPORT_W / W),
-                int(ROCKET_HEIGHT * VIEWPORT_H / H),
-            ),
-            pygame.SRCALPHA,
-        )
-        body_surf.fill(_rgb(230, 230, 230))
-        body_rot = pygame.transform.rotozoom(body_surf, angle_deg, 1.0)
-        rect = body_rot.get_rect(center=(sx, sy))
+        rx, ry = self.lander.position
+        rx_s, ry_s = _w2s(rx, ry)
+
+        nx_w, ny_w = self.lander.GetWorldPoint(NOZZLE_LOCAL)
+        nx_s,  ny_s    = _w2s(nx_w, ny_w)
+
+        # build upright sprite (centre = COM)
+        px_w = int(ROCKET_WIDTH * VIEWPORT_W / W)
+        px_h = int(ROCKET_HEIGHT * VIEWPORT_H / H)
+        body = pygame.Surface((px_w, px_h), pygame.SRCALPHA)
+        body.fill(_rgb(230, 230, 230))
+
+        # rotate it CLOCKWISE by θ → pass -θ to rotozoom
+        angle_deg = -math.degrees(self.lander.angle)
+        body_rot  = pygame.transform.rotozoom(body, -angle_deg, 1.0)
+
+        # where did the sprite’s nozzle pixel go after rotation?
+        import pygame.math as pgm
+        offset = pgm.Vector2(0,  px_h / 2).rotate(angle_deg)
+        anchor = (nx_s-offset.x, ny_s-offset.y)
+
+        # hang the rotated sprite so its nozzle pixel lands on (nx, ny)
+        rect = body_rot.get_rect(center=anchor)
         self._surface.blit(body_rot, rect)
+
+
+        # -------------------------------------------------
+        # Dot on middle
+        # -------------------------------------------------
+        # TOP_LOCAL = (0,0)                 # body-frame nose
+        # tx_w, ty_w = self.lander.GetWorldPoint(TOP_LOCAL)     # world coords
+        # tx,  ty    = _w2s(tx_w, ty_w)                         # screen coords
+        # pygame.draw.circle(self._surface, _rgb(0, 255, 0), (tx, ty), 4)   # red dot
+
+        # -------------------------------------------------
+        # Dot on nose
+        # -------------------------------------------------
+        TOP_LOCAL = (0.0, +ROCKET_HEIGHT / 2)                 # body-frame nose
+        tx_w, ty_w = self.lander.GetWorldPoint(TOP_LOCAL)     # world coords
+        tx,  ty    = _w2s(tx_w, ty_w)                         # screen coords
+        pygame.draw.circle(self._surface, _rgb(255, 0, 0), (tx, ty), 4)   # red dot
 
         # ------------------------------------------------------------------
         # 5.  Main-engine flame (line whose length ∝ throttle)
         # ------------------------------------------------------------------
-        if self.power > 0.0:
-            nx, ny = _w2s(rx, ry + ENGINE_OFFSET_Y)
-            flame_tip = (
-                nx - math.sin(self.lander.angle + self.gimbal) * 40 * self.power,
-                ny + math.cos(self.lander.angle + self.gimbal) * 40 * self.power,
-            )
-            pygame.draw.line(
-                self._surface,
-                _rgb(255, 200, 50),
-                (nx, ny),
-                flame_tip,
-                width=4,
+        
+        if self.power > 0:
+            nozzle_world = self.lander.GetWorldPoint(NOZZLE_LOCAL)
+            thrust_dir_world = self.lander.GetWorldVector(
+                (-math.sin(self.gimbal), math.cos(self.gimbal))
             )
 
-        # ------------------------------------------------------------------
-        # 6.  Smoke puffs (very light particle system)
-        # ------------------------------------------------------------------
-        if self._step_count % max(1, FPS // 10) == 0 and self.power > 0.0:
-            self._smoke.append(  # [ttl, age, screen-pos]
-                [MAX_SMOKE_LIFETIME * self.power, 0, _w2s(rx, ry + ENGINE_OFFSET_Y)]
-            )
+            # root (screen coords)
+            nx, ny = _w2s(*nozzle_world)
 
-        for puff in list(self._smoke):
-            puff[1] += 1
-            if puff[1] > puff[0]:
-                self._smoke.remove(puff)
-                continue
-            radius = int(6 + puff[1] / 2)
-            alpha = max(0, 255 - int(255 * (puff[1] / puff[0])))
-            puff_surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-            pygame.draw.circle(
-                puff_surf, (*_rgb(200, 210, 230), alpha), (radius, radius), radius
+            # tip (screen coords) –  scaled version of the same vector
+            tip_world = (
+                nozzle_world[0] - thrust_dir_world[0] * 1.2 * self.power * ROCKET_HEIGHT,
+                nozzle_world[1] - thrust_dir_world[1] * 1.2 * self.power * ROCKET_HEIGHT,
             )
-            sx_p, sy_p = puff[2]
-            self._surface.blit(puff_surf, (sx_p - radius, sy_p - radius + puff[1] // 3))
+            flame_tip = _w2s(*tip_world)
+
+            # draw flame
+            pygame.draw.line(self._surface, _rgb(255, 200, 50), (nx, ny), flame_tip, 4)
 
         # ------------------------------------------------------------------
         # 7.  Present frame / return pixels
         # ------------------------------------------------------------------
         if self.render_mode == "human":
             pygame.display.flip()
+            self._clock.tick(30)
             # keep window responsive
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
