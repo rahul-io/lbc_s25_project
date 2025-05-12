@@ -86,6 +86,10 @@ def _w2s(x: float, y: float) -> Tuple[int, int]:
     sy = int(y * (VIEWPORT_H / H))
     return sx, VIEWPORT_H - sy
 
+def normalize_angle(theta: float) -> float:
+    wrapped = (theta + math.pi) % (2 * math.pi) - math.pi
+    return wrapped
+
 # No external collision detection utilities needed - moved to class method
 
 # -----------------------------------------------------------------------------
@@ -99,6 +103,9 @@ class RocketLander(gym.Env, EzPickle):
     def __init__(self, *, render_mode: str | None = None):
         EzPickle.__init__(self, render_mode=render_mode)
         self.render_mode = render_mode
+
+        self.max_steps = 500
+        self._step_count = 0
 
         # Box2D world and placeholders
         self.world: b2World = b2World()
@@ -140,6 +147,7 @@ class RocketLander(gym.Env, EzPickle):
         super().reset(seed=seed)
         self.np_random, _ = seeding.np_random(seed)
 
+
         self._destroy_world()
         self._build_world()
 
@@ -148,32 +156,29 @@ class RocketLander(gym.Env, EzPickle):
         self._landed_ticks = 0
         self._step_count = 0
 
+        pos = self.lander.position
+        y_dist = (pos.y - self.shipheight) / (H - self.shipheight)
+        self.prev_y_dist = y_dist
+
+
+        self.prev_y_dist  = None
+        self.prev_gimbal  = 0.0
         return self._get_state(), {}
 
-    def step(self, action):  # type: ignore[override]
+    def step(self, action):  # type: ignore[override]        
         action = np.clip(action, self.action_space.low, self.action_space.high)
         self.gimbal   = float(action[0])          # rad (-π/4 … +π/4)
         self.throttle = float(action[1])          # 0 … 1
         self.power = self.throttle
 
         nozzle_world = self.lander.GetWorldPoint(NOZZLE_LOCAL)
-        print("step function")
-        print("nozzle_local", NOZZLE_LOCAL)
-
+        
         # unit vector in engine direction (lander-up rotated by gimbal)
         thrust_dir_world = self.lander.GetWorldVector(
             (-math.sin(self.gimbal), math.cos(self.gimbal))
         )
 
-        print("gimbal (degrees)", math.degrees(self.gimbal))
-        
-        deg_expected = math.degrees(self.gimbal + self.lander.angle + math.pi/2)
-        deg_actual = math.degrees(math.atan2(thrust_dir_world[1], thrust_dir_world[0]))
-        print("calculated thrust_dir_world", deg_expected)
-        print("thrust_dir_world (degrees)", deg_actual)
-        print("diff", (deg_expected - deg_actual + 180) % 360 - 180)
-        # print("throttle", self.throttle)
-
+        # Calculate and apply main engine force
         main_force = (
             thrust_dir_world[0] * MAIN_ENGINE_POWER * self.power,
             thrust_dir_world[1] * MAIN_ENGINE_POWER * self.power,
@@ -184,9 +189,6 @@ class RocketLander(gym.Env, EzPickle):
 
         # Physics step
         self.world.Step(1.0 / FPS, 60, 60)
-        print("nozzle_world", nozzle_world)
-        print("lander position", self.lander.position)
-        print("lander angle (degrees)", math.degrees(self.lander.angle))
         
         # Check for collision (replaces contact listener)
         if self._check_lander_collision():
@@ -195,6 +197,9 @@ class RocketLander(gym.Env, EzPickle):
         obs = self._get_state()
         reward, terminated = self._compute_reward()
         self._step_count += 1
+        if self._step_count >= self.max_steps:
+            return obs, reward, False, True, {} 
+        
         return obs, reward, terminated, False, {}
     
     def render(self):  # ← inside class RocketLander
@@ -549,12 +554,11 @@ class RocketLander(gym.Env, EzPickle):
 
         # Remove leg contact and broken leg checks
         outside = abs(pos.x - W / 2) > W / 2 or pos.y > H
-        fuel_cost = 0.1 * (0.5 * self.power) / FPS
         
         # New landing check based on lander position instead of leg contact
-        landed = pos.y <= self.shipheight + 0.1 and speed < 0.1 and abs(angle) < 0.1
+        landed = pos.y <= self.shipheight and speed < 0.1 and abs(angle) < 0.1
 
-        reward = -fuel_cost
+        reward = 0
         terminated = False
 
         if outside:
@@ -577,7 +581,7 @@ class RocketLander(gym.Env, EzPickle):
             else:
                 self._landed_ticks = 0
             if self._landed_ticks >= FPS:
-                reward = 1.0
+                reward = 10.0
                 terminated = True
 
         if terminated:
