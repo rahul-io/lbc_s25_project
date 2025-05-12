@@ -31,7 +31,6 @@ from typing import Any, List, Tuple
 import numpy as np
 from Box2D import b2World  # type: ignore
 from Box2D.b2 import (
-    contactListener,
     distanceJointDef,
     fixtureDef,
     polygonShape,
@@ -87,30 +86,7 @@ def _w2s(x: float, y: float) -> Tuple[int, int]:
     sy = int(y * (VIEWPORT_H / H))
     return sx, VIEWPORT_H - sy
 
-# -----------------------------------------------------------------------------
-# Contact listener
-# -----------------------------------------------------------------------------
-
-
-class _Contact(contactListener):
-    def __init__(self, env: "RocketLander"):
-        super().__init__()
-        self.env = env
-
-    def BeginContact(self, contact):  # noqa: N802
-        bodies = (contact.fixtureA.body, contact.fixtureB.body)
-        if any(b in bodies for b in (self.env.water, self.env.lander, *self.env.containers)):
-            self.env._game_over = True
-            return
-        for leg in self.env.legs:
-            if leg in bodies:
-                leg.ground_contact = True
-
-    def EndContact(self, contact):  # noqa: N802
-        bodies = (contact.fixtureA.body, contact.fixtureB.body)
-        for leg in self.env.legs:
-            if leg in bodies:
-                leg.ground_contact = False
+# No external collision detection utilities needed - moved to class method
 
 # -----------------------------------------------------------------------------
 # Main environment
@@ -133,11 +109,11 @@ class RocketLander(gym.Env, EzPickle):
         # RNG object assigned in reset
         self.np_random: np.random.Generator
 
-        # Spaces
-        high = np.array([1] * 7 + [np.inf] * 3, dtype=np.float32)
+        # Spaces - Updated to remove leg contact variables (2 fewer elements)
+        high = np.array([1] * 5 + [np.inf] * 3, dtype=np.float32)  # 5 instead of 7
         low = -high
         if not VEL_STATE:
-            high, low = high[:7], low[:7]
+            high, low = high[:5], low[:5]  # 5 instead of 7
         self.observation_space = spaces.Box(low, high, dtype=np.float32)
         self.action_space = spaces.Box(
             low=np.array([-GIMBAL_LIMIT, 0.0], dtype=np.float32),
@@ -211,6 +187,10 @@ class RocketLander(gym.Env, EzPickle):
         print("nozzle_world", nozzle_world)
         print("lander position", self.lander.position)
         print("lander angle (degrees)", math.degrees(self.lander.angle))
+        
+        # Check for collision (replaces contact listener)
+        if self._check_lander_collision():
+            self._game_over = True
 
         obs = self._get_state()
         reward, terminated = self._compute_reward()
@@ -237,6 +217,7 @@ class RocketLander(gym.Env, EzPickle):
         if self._window is None:
             if self.render_mode == "human":
                 pygame.init()
+                pygame.display.init()
                 self._window = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))
             else:  # "rgb_array"
                 self._window = pygame.Surface((VIEWPORT_W, VIEWPORT_H))
@@ -304,23 +285,6 @@ class RocketLander(gym.Env, EzPickle):
         rect = body_rot.get_rect(center=anchor)
         self._surface.blit(body_rot, rect)
 
-
-        # -------------------------------------------------
-        # Dot on middle
-        # -------------------------------------------------
-        # TOP_LOCAL = (0,0)                 # body-frame nose
-        # tx_w, ty_w = self.lander.GetWorldPoint(TOP_LOCAL)     # world coords
-        # tx,  ty    = _w2s(tx_w, ty_w)                         # screen coords
-        # pygame.draw.circle(self._surface, _rgb(0, 255, 0), (tx, ty), 4)   # red dot
-
-        # -------------------------------------------------
-        # Dot on nose
-        # -------------------------------------------------
-        TOP_LOCAL = (0.0, +ROCKET_HEIGHT / 2)                 # body-frame nose
-        tx_w, ty_w = self.lander.GetWorldPoint(TOP_LOCAL)     # world coords
-        tx,  ty    = _w2s(tx_w, ty_w)                         # screen coords
-        pygame.draw.circle(self._surface, _rgb(255, 0, 0), (tx, ty), 4)   # red dot
-
         # ------------------------------------------------------------------
         # 5.  Main-engine flame (line whose length ∝ throttle)
         # ------------------------------------------------------------------
@@ -345,7 +309,87 @@ class RocketLander(gym.Env, EzPickle):
             pygame.draw.line(self._surface, _rgb(255, 200, 50), (nx, ny), flame_tip, 4)
 
         # ------------------------------------------------------------------
-        # 7.  Present frame / return pixels
+        # 6.  Containers (penalty objects at ship edges)
+        # ------------------------------------------------------------------
+        for container in self.containers:
+            # Get the vertices of the container polygon
+            vertices = []
+            for vertex in container.fixtures[0].shape.vertices:
+                world_vertex = container.transform * vertex
+                screen_vertex = _w2s(*world_vertex)
+                vertices.append(screen_vertex)
+            
+            # Draw container as a polygon
+            if len(vertices) >= 3:  # Need at least 3 points for a polygon
+                pygame.draw.polygon(self._surface, _rgb(206, 206, 2), vertices)
+        
+        # ------------------------------------------------------------------
+        # 7.  Legs (visual only)
+        # ------------------------------------------------------------------
+        for i, leg in enumerate(self.legs):
+            # Calculate the leg's attachment point relative to the lander
+            side = -1 if i == 0 else 1  # Left leg or right leg
+            
+            # Calculate leg's position relative to the lander's current position
+            # Attach leg to the bottom of the lander
+            leg_attach_local = (-side * LEG_AWAY, -ROCKET_HEIGHT/2 + 0.1)
+            leg_attach_world = self.lander.GetWorldPoint(leg_attach_local)
+            
+            # Store the updated world position for the leg
+            leg_world_pos = leg_attach_world
+            
+            # Calculate leg angle (base angle + lander angle)
+            leg_angle = side * BASE_ANGLE + self.lander.angle
+            
+            # Get the vertices of the visual leg
+            vertices = []
+            for vertex in leg['vertices']:
+                # Apply the updated leg position and angle to each vertex
+                cos_a = math.cos(leg_angle)
+                sin_a = math.sin(leg_angle)
+                # Rotate vertex
+                rotated_x = vertex[0] * cos_a - vertex[1] * sin_a
+                rotated_y = vertex[0] * sin_a + vertex[1] * cos_a
+                # Translate to world position
+                world_vertex = (
+                    leg_world_pos[0] + rotated_x,
+                    leg_world_pos[1] + rotated_y,
+                )
+                screen_vertex = _w2s(*world_vertex)
+                vertices.append(screen_vertex)
+            
+            # Draw leg as a polygon
+            if len(vertices) >= 3:  # Need at least 3 points for a polygon
+                pygame.draw.polygon(self._surface, leg['color'], vertices)
+            
+            # Ground contact indicator - show when near the ground
+            # Check if any part of the leg is close to the ground
+            # Project vertices to world coordinates to check ground contact
+            world_vertices = []
+            for vertex in leg['vertices']:
+                # Apply rotation
+                cos_a = math.cos(leg_angle)
+                sin_a = math.sin(leg_angle)
+                rotated_x = vertex[0] * cos_a - vertex[1] * sin_a
+                rotated_y = vertex[0] * sin_a + vertex[1] * cos_a
+                # Calculate world position
+                world_vertex = (
+                    leg_world_pos[0] + rotated_x,
+                    leg_world_pos[1] + rotated_y,
+                )
+                world_vertices.append(world_vertex)
+            
+            # Find the lowest point of the leg in world coordinates
+            leg_bottom_y = min([v[1] for v in world_vertices])
+            leg['ground_contact'] = leg_bottom_y <= self.shipheight + 0.1
+            
+            if leg['ground_contact']:
+                # Find the bottom-most point of the leg in screen coordinates
+                bottom_point = min(vertices, key=lambda p: p[1])
+                pygame.draw.circle(self._surface, _rgb(0, 255, 0), bottom_point, 3)
+
+        # ------------------------------------------------------------------
+        # 8.  Present frame / return pixels
         # ------------------------------------------------------------------
         if self.render_mode == "human":
             pygame.display.flip()
@@ -367,10 +411,8 @@ class RocketLander(gym.Env, EzPickle):
         if self.water is None:                # nothing to clean up
             return
 
-        # Detach the contact listener first to avoid Box2D assertions
-        self.world.contactListener = None     # type: ignore[attr-defined]
-
-        for body in [self.water, self.lander, self.ship, *self.legs, *self.containers]:
+        # No need to destroy legs since they're just visual data now
+        for body in [self.water, self.lander, self.ship, *self.containers]:
             self.world.DestroyBody(body)
 
         # Clear references
@@ -383,10 +425,6 @@ class RocketLander(gym.Env, EzPickle):
     # ------------------------------------------------------------------
     def _build_world(self) -> None:
         """Create water, ship deck, lander, legs and joints for a new episode."""
-        # Contact listener
-        self.world.contactListener_keepref = _Contact(self)  # type: ignore[attr-defined]
-        self.world.contactListener = self.world.contactListener_keepref  # type: ignore[attr-defined]
-
         # --- Static water rectangle -------------------------------------------------
         self.terrainheight = H / 20                           # flat sea
         water_poly = ((0, 0), (W, 0), (W, self.terrainheight), (0, self.terrainheight))
@@ -443,58 +481,24 @@ class RocketLander(gym.Env, EzPickle):
         )
         self.lander.color1 = _rgb(230, 230, 230)
 
-        # --- Legs -------------------------------------------------------------------
+        # --- Create Visual Legs (no physics) ----------------------------------------
+        # Store just enough information to render the legs visually
         self.legs.clear()
         for side in (-1, 1):
-            leg = self.world.CreateDynamicBody(
-                position=(spawn_x - side * LEG_AWAY, spawn_y + ROCKET_WIDTH * 0.2),
-                angle=side * BASE_ANGLE,
-                fixtures=fixtureDef(
-                    shape=polygonShape(
-                        vertices=(
-                            (0, 0),
-                            (0, LEG_LENGTH / 25),
-                            (side * LEG_LENGTH, 0),
-                            (side * LEG_LENGTH, -LEG_LENGTH / 20),
-                            (side * LEG_LENGTH / 3, -LEG_LENGTH / 7),
-                        )
-                    ),
-                    density=1.0,
-                    friction=0.2,
-                ),
-            )
-            leg.ground_contact = False                       # type: ignore[attr-defined]
-            leg.color1 = _rgb(64, 64, 64)
-
-            # Revolute spring joint
-            rjd = revoluteJointDef(
-                bodyA=self.lander,
-                bodyB=leg,
-                localAnchorA=(side * LEG_AWAY, ROCKET_WIDTH * 0.2),
-                localAnchorB=(0, 0),
-                enableLimit=True,
-                enableMotor=True,
-                maxMotorTorque=2500.0,
-                motorSpeed=-0.05 * side,
-            )
-            if side == 1:
-                rjd.lowerAngle, rjd.upperAngle = -SPRING_ANGLE, 0
-            else:
-                rjd.lowerAngle, rjd.upperAngle = 0, SPRING_ANGLE
-            leg.joint = self.world.CreateJoint(rjd)
-
-            # Distance joint for damping
-            djd = distanceJointDef(
-                bodyA=self.lander,
-                bodyB=leg,
-                anchorA=(side * LEG_AWAY, ROCKET_HEIGHT / 8),
-                anchorB=leg.fixtures[0].body.transform * (side * LEG_LENGTH, 0),
-                collideConnected=False,
-                frequencyHz=0.01,
-                dampingRatio=0.9,
-            )
-            leg.joint2 = self.world.CreateJoint(djd)
-            self.legs.append(leg)
+            # Create visual leg data without Box2D physics
+            visual_leg = {
+                'side': side,  # Store which side this leg is on
+                'color': _rgb(64, 64, 64),
+                'vertices': [
+                    (0, 0),
+                    (0, LEG_LENGTH / 25),
+                    (side * LEG_LENGTH, 0),
+                    (side * LEG_LENGTH, -LEG_LENGTH / 20),
+                    (side * LEG_LENGTH / 3, -LEG_LENGTH / 7),
+                ],
+                'ground_contact': False  # Keep this attribute for rendering
+            }
+            self.legs.append(visual_leg)
 
         # Initial velocities
         self.lander.linearVelocity = (
@@ -515,12 +519,11 @@ class RocketLander(gym.Env, EzPickle):
         x_dist = (pos.x - W / 2) / W
         y_dist = (pos.y - self.shipheight) / (H - self.shipheight)
 
+        # State without legs
         state: List[float] = [
             2 * x_dist,
             2 * (y_dist - 0.5),
             angle,
-            1.0 if self.legs[0].ground_contact else 0.0,
-            1.0 if self.legs[1].ground_contact else 0.0,
             2 * (self.throttle - 0.5),
             self.gimbal / GIMBAL_LIMIT,
         ]
@@ -544,16 +547,17 @@ class RocketLander(gym.Env, EzPickle):
         angle = (self.lander.angle / math.pi) % 2
         angle = angle - 2 if angle > 1 else angle
 
-        ground_contact = self.legs[0].ground_contact or self.legs[1].ground_contact
-        broken_leg = ((self.legs[0].joint.angle < 0 or self.legs[1].joint.angle > 0) and ground_contact)
+        # Remove leg contact and broken leg checks
         outside = abs(pos.x - W / 2) > W / 2 or pos.y > H
         fuel_cost = 0.1 * (0.5 * self.power) / FPS
-        landed = ground_contact and speed < 0.1
+        
+        # New landing check based on lander position instead of leg contact
+        landed = pos.y <= self.shipheight + 0.1 and speed < 0.1 and abs(angle) < 0.1
 
         reward = -fuel_cost
         terminated = False
 
-        if outside or broken_leg:
+        if outside:
             self._game_over = True
 
         if self._game_over:
@@ -561,12 +565,13 @@ class RocketLander(gym.Env, EzPickle):
         else:
             shaping = (
                 -0.5 * (distance + speed + angle ** 2 + vel_a ** 2)
-                + 0.1 * (self.legs[0].ground_contact + self.legs[1].ground_contact)
+                # No leg bonus
             )
             if self._prev_shaping is not None:
                 reward += shaping - self._prev_shaping
             self._prev_shaping = shaping
 
+            # Landing detection without legs
             if landed:
                 self._landed_ticks += 1
             else:
@@ -579,3 +584,44 @@ class RocketLander(gym.Env, EzPickle):
             reward += max(-1, 0 - 2 * (speed + distance + abs(angle) + abs(vel_a)))
 
         return float(np.clip(reward, -1, 1)), terminated
+
+    # ------------------------------------------------------------------
+    # Collision detection helper
+    # ------------------------------------------------------------------
+    def _check_lander_collision(self) -> bool:
+        """
+        Checks if the lander collides with water or containers.
+        Returns True if a collision is detected, False otherwise.
+        This replaces the Box2D contact listener for collision detection.
+        """
+        # Get lander position and dimensions
+        pos = self.lander.position
+        lander_bottom = pos.y - ROCKET_HEIGHT/2
+        lander_left = pos.x - ROCKET_WIDTH/2
+        lander_right = pos.x + ROCKET_WIDTH/2
+
+        # Check for water collision - game over if the bottom of the rocket touches water
+        if lander_bottom <= self.terrainheight:
+            return True
+        
+        # Check for container collisions using simplified bounding box checks
+        for container in self.containers:
+            # Get container vertices in world coordinates
+            vertices = [container.transform * v for v in container.fixtures[0].shape.vertices]
+            
+            # Find container bounding box
+            container_left = min(v[0] for v in vertices)
+            container_right = max(v[0] for v in vertices)
+            container_bottom = min(v[1] for v in vertices)
+            container_top = max(v[1] for v in vertices)
+            
+            # Simple rectangular collision check (AABB)
+            # This checks if the lander's bounding box overlaps with the container's bounding box
+            if (lander_right >= container_left and 
+                lander_left <= container_right and
+                lander_bottom <= container_top and
+                pos.y >= container_bottom):
+                return True
+        
+        # No collision detected
+        return False
