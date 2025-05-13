@@ -11,6 +11,7 @@ import csv
 import math
 from RocketLander import RocketLander, FPS
 from stable_baselines3 import PPO
+import random
 
 
 def compute_distance(p1, p2):
@@ -26,7 +27,7 @@ def run_episodes(model_path: str, num_episodes: int, render: bool):
     for ep in range(1, num_episodes + 1):
         # Instantiate env with or without rendering
         env = RocketLander(render_mode="human" if render else None)
-        obs, _ = env.reset(seed=ep)
+        obs, _ = env.reset(seed=random.randint(0, 2**32 - 1))
 
         # Precompute pad center for distance metrics
         pad_x = (env.helipad_x1 + env.helipad_x2) / 2
