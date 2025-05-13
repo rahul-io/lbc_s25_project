@@ -104,7 +104,7 @@ class RocketLander(gym.Env, EzPickle):
         EzPickle.__init__(self, render_mode=render_mode)
         self.render_mode = render_mode
 
-        self.max_steps = 500
+        self.max_steps = 1000
         self._step_count = 0
 
         # Box2D world and placeholders
@@ -546,7 +546,6 @@ class RocketLander(gym.Env, EzPickle):
 
         x_dist = (pos.x - W / 2) / W
         y_dist = (pos.y - self.shipheight) / (H - self.shipheight)
-        distance = np.linalg.norm((3 * x_dist, y_dist))           # x weighted more
         speed = np.linalg.norm(vel_l)
 
         angle = (self.lander.angle / math.pi) % 2
@@ -567,10 +566,14 @@ class RocketLander(gym.Env, EzPickle):
         if self._game_over:
             terminated = True
         else:
-            shaping = (
-                -0.5 * (distance + speed + angle ** 2 + vel_a ** 2)
-                # No leg bonus
-            )
+            shaping_x = -1.0 * abs(x_dist)      # horizontal penalty
+            shaping_y = -1.2 * abs(y_dist)      # altitude penalty (stronger)
+            shaping   = shaping_x + shaping_y
+            # keep the other terms as before
+            shaping  += -0.5 * speed
+            shaping  += -0.5 * (angle ** 2)
+            shaping  += -0.5 * (vel_a ** 2)
+
             if self._prev_shaping is not None:
                 reward += shaping - self._prev_shaping
             self._prev_shaping = shaping
@@ -585,7 +588,7 @@ class RocketLander(gym.Env, EzPickle):
                 terminated = True
 
         if terminated:
-            reward += max(-1, 0 - 2 * (speed + distance + abs(angle) + abs(vel_a)))
+            reward += max(-1, 0 - 2 * (speed + x_dist + y_dist + abs(angle) + abs(vel_a)))
 
         return float(np.clip(reward, -1, 1)), terminated
 
